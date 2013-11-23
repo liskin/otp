@@ -587,7 +587,7 @@ init_main(Starter) ->
     register(?SERVER,self()),
     %% Having write concurrancy here gives a 40% performance boost
     %% when collect/1 is called. 
-    [ets:new(T, [set, public, named_table]) || T <- cover_table_names()],
+    [ets:new(T, [set, public, named_table, {write_concurrency, true}]) || T <- cover_table_names()],
     ets:new(?COVER_CLAUSE_TABLE, [set, public, named_table]),
     ets:new(?BINARY_TABLE, [set, named_table]),
     ets:new(?COLLECTION_TABLE, [set, public, named_table]),
@@ -1951,6 +1951,7 @@ common_elems(L1, L2) ->
 %% Collect data for all modules
 collect(Nodes) ->
     %% local node
+    collapse_cover_tables(),
     AllClauses = ets:tab2list(?COVER_CLAUSE_TABLE),
     pmap(fun move_modules/1,AllClauses),
     
@@ -1974,15 +1975,28 @@ move_modules({Module,Clauses}) ->
     
 move_clauses([{M,F,A,C,_L}|Clauses]) ->
     Pattern = {#bump{module=M, function=F, arity=A, clause=C}, '_'},
-    Bumps = lists:append([ets:match_object(T,Pattern) || T <- cover_table_names()]),
+    T = hd(cover_table_names()),
+    Bumps = ets:match_object(T,Pattern),
     lists:foreach(fun({Key,Val}) ->
-			  [ets:insert(T, {Key,0}) || T <- cover_table_names()],
+			  ets:insert(T, {Key,0}),
 			  insert_in_collection_table(Key,Val)
 		  end,
 		  Bumps),
     move_clauses(Clauses);
 move_clauses([]) ->
     ok.
+
+collapse_cover_tables() ->
+    [First|Rest] = cover_table_names(),
+    lists:foreach(fun(Src) -> collapse_cover_table(Src, First) end, Rest).
+
+collapse_cover_table(Src, Dst) ->
+    Bumps = ets:tab2list(Src),
+    lists:foreach(fun({Key,Val}) ->
+			  ets:insert(Dst, {Key,Val}),
+			  ets:insert(Src, {Key,0})
+		  end,
+		  Bumps).
 
 %% Given a .beam file, find the .erl file. Look first in same directory as
 %% the .beam file, then in ../src, then in compile info.
