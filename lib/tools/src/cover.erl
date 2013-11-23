@@ -587,9 +587,7 @@ init_main(Starter) ->
     register(?SERVER,self()),
     %% Having write concurrancy here gives a 40% performance boost
     %% when collect/1 is called. 
-    ets:new(?COVER_TABLE, [set, public, named_table
-			   ,{write_concurrency, true}
-			  ]),
+    [ets:new(T, [set, public, named_table]) || T <- cover_table_names()],
     ets:new(?COVER_CLAUSE_TABLE, [set, public, named_table]),
     ets:new(?BINARY_TABLE, [set, named_table]),
     ets:new(?COLLECTION_TABLE, [set, public, named_table]),
@@ -597,6 +595,10 @@ init_main(Starter) ->
     net_kernel:monitor_nodes(true),
     Starter ! {?SERVER,started},
     main_process_loop(#main_state{}).
+
+cover_table_names() ->
+    N = erlang:system_info(schedulers),
+    [list_to_atom(atom_to_list(?COVER_TABLE) ++ integer_to_list(I)) || I <- lists:seq(1, N)].
 
 main_process_loop(State) ->
     receive
@@ -724,7 +726,7 @@ main_process_loop(State) ->
 	      end,
 	      State#main_state.nodes),
 	    reload_originals(State#main_state.compiled),
-            ets:delete(?COVER_TABLE),
+            [ets:delete(T) || T <- cover_table_names()],
             ets:delete(?COVER_CLAUSE_TABLE),
             ets:delete(?BINARY_TABLE),
             ets:delete(?COLLECTION_TABLE),
@@ -842,10 +844,7 @@ main_process_loop(State) ->
 
 init_remote(Starter,MainNode) ->
     register(?SERVER,self()),
-    ets:new(?COVER_TABLE, [set, public, named_table
-			   %% write_concurrency here makes otp_8270 break :(
-			   %,{write_concurrency, true}
-			  ]),
+    [ets:new(T, [set, public, named_table]) || T <- cover_table_names()],
     ets:new(?COVER_CLAUSE_TABLE, [set, public, named_table]),
     Starter ! {self(),started},
     remote_process_loop(#remote_state{main_node=MainNode}).
@@ -884,7 +883,7 @@ remote_process_loop(State) ->
 
 	{remote,stop} ->
 	    reload_originals(State#remote_state.compiled),
-	    ets:delete(?COVER_TABLE),
+	    [ets:delete(T) || T <- cover_table_names()],
             ets:delete(?COVER_CLAUSE_TABLE),
             unregister(?SERVER),
 	    ok; % not replying since 'DOWN' message will be received anyway
@@ -939,10 +938,10 @@ do_collect(Module, CollectorPid, From) ->
 send_collected_data({M,F,A,C,_L}, CollectorPid) ->
     Pattern = 
 	{#bump{module=M, function=F, arity=A, clause=C}, '_'},
-    Bumps = ets:match_object(?COVER_TABLE, Pattern),
+    Bumps = lists:append([ets:match_object(T, Pattern) || T <- cover_table_names()]),
     %% Reset
     lists:foreach(fun({Bump,_N}) ->
-			  ets:insert(?COVER_TABLE, {Bump,0})
+			  [ets:insert(T, {Bump,0}) || T <- cover_table_names()]
 		  end,
 		  Bumps),
     CollectorPid ! {chunk,Bumps}.
@@ -988,7 +987,7 @@ insert_initial_data([Item|Items]) when is_atom(element(1,Item)) ->
     ets:insert(?COVER_CLAUSE_TABLE, Item),
     insert_initial_data(Items);
 insert_initial_data([Item|Items]) ->
-    ets:insert(?COVER_TABLE, Item),
+    [ets:insert(T, Item) || T <- cover_table_names()],
     insert_initial_data(Items);
 insert_initial_data([]) ->
     ok.
@@ -1110,7 +1109,7 @@ remote_load_compiled(Nodes, [MF | Rest], Acc, ModNum) ->
 get_data_for_remote_loading({Module,File}) ->
     [{Module,Binary}] = ets:lookup(?BINARY_TABLE,Module),
     %%! The InitialTable list will be long if the module is big - what to do??
-    InitialBumps = ets:select(?COVER_TABLE,ms(Module)),
+    InitialBumps = ets:select(hd(cover_table_names()),ms(Module)),
     InitialClauses = ets:lookup(?COVER_CLAUSE_TABLE,Module),
 
     {Module,File,Binary,InitialBumps ++ InitialClauses}.
@@ -1638,13 +1637,14 @@ munge_body([Expr|Body], Vars, MungedBody, LastExprBumpLines) ->
             MungedExprs1 = [MungedExpr|MungedBody1],
 	    munge_body(Body, Vars3, MungedExprs1, NewBumps);
 	false ->
-	    ets:insert(?COVER_TABLE, {#bump{module   = Vars#vars.module,
-					    function = Vars#vars.function,
-					    arity    = Vars#vars.arity,
-					    clause   = Vars#vars.clause,
-					    line     = Line},
-				      0}),
+	    [ets:insert(T, {#bump{module   = Vars#vars.module,
+				  function = Vars#vars.function,
+				  arity    = Vars#vars.arity,
+				  clause   = Vars#vars.clause,
+				  line     = Line},
+			    0}) || T <- cover_table_names()],
             Bump = bump_call(Vars, Line),
+%	    FIXME:
 %	    Bump = {call, 0, {remote, 0, {atom,0,cover}, {atom,0,bump}},
 %		    [{atom, 0, Vars#vars.module},
 %		     {atom, 0, Vars#vars.function},
@@ -1769,7 +1769,7 @@ bumps_line(E, L) ->
     try bumps_line1(E, L) catch true -> true end.
 
 bumps_line1({call,0,{remote,0,{atom,0,ets},{atom,0,update_counter}},
-             [{atom,0,?COVER_TABLE},{tuple,0,[_,_,_,_,_,{integer,0,Line}]},_]},
+             [_,{tuple,0,[{atom,0,?BUMP_REC_NAME},_,_,_,_,{integer,0,Line}]},_]},
             Line) ->
     throw(true);
 bumps_line1([E | Es], Line) ->
@@ -1784,7 +1784,7 @@ bumps_line1(_, _) ->
 
 bump_call(Vars, Line) ->
     {call,0,{remote,0,{atom,0,ets},{atom,0,update_counter}},
-     [{atom,0,?COVER_TABLE},
+     [current_cover_table_name(),
       {tuple,0,[{atom,0,?BUMP_REC_NAME},
                 {atom,0,Vars#vars.module},
                 {atom,0,Vars#vars.function},
@@ -1792,6 +1792,12 @@ bump_call(Vars, Line) ->
                 {integer,0,Vars#vars.clause},
                 {integer,0,Line}]},
       {integer,0,1}]}.
+
+current_cover_table_name() ->
+    {call,0,{atom,0,element},
+     [{call,0,{remote,0,{atom,0,erlang},{atom,0,system_info}},
+       [{atom,0,scheduler_id}]},
+      {tuple,0,[{atom,0,T} || T <- cover_table_names()]}]}.
 
 munge_expr({match,Line,ExprL,ExprR}, Vars) ->
     {MungedExprL, Vars2} = munge_expr(ExprL, Vars),
@@ -1968,9 +1974,9 @@ move_modules({Module,Clauses}) ->
     
 move_clauses([{M,F,A,C,_L}|Clauses]) ->
     Pattern = {#bump{module=M, function=F, arity=A, clause=C}, '_'},
-    Bumps = ets:match_object(?COVER_TABLE,Pattern),
+    Bumps = lists:append([ets:match_object(T,Pattern) || T <- cover_table_names()]),
     lists:foreach(fun({Key,Val}) ->
-			  ets:insert(?COVER_TABLE, {Key,0}),
+			  [ets:insert(T, {Key,0}) || T <- cover_table_names()],
 			  insert_in_collection_table(Key,Val)
 		  end,
 		  Bumps),
@@ -2401,9 +2407,9 @@ do_reset(Module) ->
 
 do_reset2([{M,F,A,C,_L}|Clauses]) ->
     Pattern = {#bump{module=M, function=F, arity=A, clause=C}, '_'},
-    Bumps = ets:match_object(?COVER_TABLE, Pattern),
+    Bumps = lists:append([ets:match_object(T, Pattern) || T <- cover_table_names()]),
     lists:foreach(fun({Bump,_N}) ->
-			  ets:insert(?COVER_TABLE, {Bump,0})
+			  [ets:insert(T, {Bump,0}) || T <- cover_table_names()]
 		  end,
 		  Bumps),
     do_reset2(Clauses);
@@ -2412,7 +2418,7 @@ do_reset2([]) ->
 
 do_clear(Module) ->
     ets:match_delete(?COVER_CLAUSE_TABLE, {Module,'_'}),
-    ets:match_delete(?COVER_TABLE, {#bump{module=Module},'_'}),
+    [ets:match_delete(T, {#bump{module=Module},'_'}) || T <- cover_table_names()],
     case lists:member(?COLLECTION_TABLE, ets:all()) of
 	true ->
 	    %% We're on the main node
